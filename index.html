@@ -1,0 +1,165 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Free Trap Beats (No Vocals)</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<style>
+body{font-family:system-ui,sans-serif;background:#0e0e10;color:#eee;margin:0}
+header{position:sticky;top:0;background:#0e0e10;padding:10px;display:flex;gap:8px;
+flex-wrap:wrap;align-items:center;border-bottom:1px solid #222;z-index:2}
+input{flex:1;min-width:180px;padding:8px;background:#1a1a1e;color:#eee;
+border:1px solid #333;border-radius:6px}
+button{padding:8px 12px;background:#1a1a1e;color:#eee;border:1px solid #333;
+border-radius:6px;cursor:pointer}button:hover{background:#26262c}
+audio{width:100%;padding:8px 10px;box-sizing:border-box}
+#info{padding:2px 12px 8px;color:#89a;font-size:13px;word-break:break-word}
+#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+gap:8px;padding:12px}
+.c{background:#17171b;border:1px solid #26262c;border-radius:8px;padding:10px;
+cursor:pointer;overflow:hidden}.c:hover{border-color:#556}.c.now{border-color:#4a8cff}
+.c b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.c i{color:#889;font-size:12px;font-style:normal}
+#pg{text-align:center;color:#889;padding:8px 0 30px}
+#st{color:#889;font-size:12px}
+</style></head><body>
+<header><input id="q" type="search" placeholder="Search loaded tracks...">
+<button id="pgp" title="Previous page">&#9664; pg</button>
+<button id="pgn" title="Next page">pg &#9654;</button>
+<button id="skip" title="Next track">&#9197; Next</button>
+<button id="rnd" title="Shuffle mode">&#128256; Random</button>
+<button id="mode" title="Toggle continuation mode">&#9654; Order</button>
+<button id="auto" title="Autoplay continuation on/off">Auto &#10003;</button>
+<button id="more">+10 chunks</button><span id="st"></span></header>
+<audio id="au" controls preload="none"></audio>
+<div id="info">Click a track - playback continues automatically.</div>
+<div id="list"></div><div id="pg"></div>
+<script>
+const PROXY = ""; // if Chrome fails playback (CORS): "https://corsproxy.io/?url="
+let M, T = [], F = [], p = 0, hls = null;
+let mode = "order";      // "order" = play list top-to-bottom, "random" = shuffle
+let auto = true;         // continue to the next track when one ends
+let curT = null;         // currently playing track object
+let fails = 0, lastSkip = 0;
+const PER = 60;
+const au = document.getElementById('au');
+const $ = id => document.getElementById(id);
+const st = t => $('st').textContent = t;
+
+async function chunk(i){
+  if (i < 0 || i >= M.chunks.length || M.loaded[i]) return;
+  const d = await (await fetch('data/' + M.chunks[i])).json();
+  T = T.concat(d); M.loaded[i] = 1;
+  st(T.length.toLocaleString() + ' / ' + M.total.toLocaleString() + ' loaded');
+}
+async function more(n){
+  let k = 0;
+  for (let i = 0; i < M.chunks.length && k < n; i++)
+    if (!M.loaded[i]) { await chunk(i); k++; }
+}
+function applyFilter(){
+  const q = $('q').value.trim().toLowerCase();
+  F = q ? T.filter(t => t.t.toLowerCase().includes(q)) : T;
+}
+function flt(){ applyFilter(); p = 0; draw(); }
+function draw(){
+  const el = $('list'); el.innerHTML = '';
+  const s = p * PER;
+  for (const t of F.slice(s, s + PER)){
+    const d = document.createElement('div'); d.className = 'c'; d.dataset.i = t.i;
+    const b = document.createElement('b'); b.textContent = t.t;
+    const i = document.createElement('i'); i.textContent = t.i;
+    d.append(b, i);
+    d.onclick = () => { setMode('order'); play(t, d); };
+    el.appendChild(d);
+  }
+  $('pg').textContent = F.length
+    ? (s+1) + '-' + Math.min(s+PER, F.length) + ' of '
+      + F.length.toLocaleString() + ' loaded (page ' + (p+1) + ')'
+    : 'no matches';
+}
+function setMode(m){
+  mode = m;
+  $('mode').innerHTML = m === 'order' ? '&#9654; Order' : '&#128256; Random';
+}
+function play(t, card){
+  curT = t;
+  document.querySelectorAll('.c.now').forEach(c => c.classList.remove('now'));
+  const sel = '.c[data-i="' + CSS.escape(String(t.i)) + '"]';
+  const el = card || document.querySelector(sel);
+  if (el){ el.classList.add('now'); el.scrollIntoView({block:'nearest'}); }
+  $('info').textContent = '\u25B6 ' + t.t;
+  const u = PROXY ? PROXY + encodeURIComponent(t.u) : t.u;
+  if (au.canPlayType('application/vnd.apple.mpegurl')){
+    au.src = u; au.play().catch(()=>{});
+  } else if (window.Hls && Hls.isSupported()){
+    if (hls) hls.destroy();
+    hls = new Hls({maxBufferLength: 30});
+    hls.loadSource(u); hls.attachMedia(au);
+    hls.on(Hls.Events.ERROR, (_, e) => { if (e.fatal) skipFail(); });
+    au.play().catch(()=>{});
+  } else $('info').textContent = 'No HLS support in this browser.';
+}
+async function nextTrack(dir = 1){
+  if (!F.length){
+    if ($('q').value){ $('q').value = ''; }
+    applyFilter();
+    if (!F.length) return;
+  }
+  if (mode === 'random'){
+    let t;
+    do { t = F[Math.floor(Math.random() * F.length)]; }
+    while (F.length > 1 && t === curT);
+    play(t); return;
+  }
+  let idx = curT ? F.indexOf(curT) : -1;
+  if (idx === -1) idx = Math.min(p * PER, F.length - 1);
+  let target = idx + dir;
+  if (target >= F.length){
+    const i = M.chunks.findIndex((_, j) => !M.loaded[j]);
+    if (i >= 0){                       // ran out of loaded tracks - load one more chunk
+      await chunk(i);
+      applyFilter();
+      idx = curT ? F.indexOf(curT) : -1;
+      target = idx === -1 ? 0 : idx + dir;
+    }
+    if (target >= F.length) target = 0;  // everything loaded -> wrap to start
+  }
+  if (target < 0) target = F.length - 1;
+  p = Math.floor(target / PER);          // follow the playing track in the list
+  draw();
+  play(F[target]);
+}
+function skipFail(){
+  if (Date.now() - lastSkip < 500) return;  // one skip per failure, not two
+  lastSkip = Date.now();
+  fails++;
+  if (!auto || fails > 5){
+    $('info').textContent = fails > 5
+      ? 'Stopped: 5 consecutive playback failures.'
+      : 'Playback failed (CORS or dead link).';
+    return;
+  }
+  setTimeout(() => nextTrack(1), 700);   // dead link -> auto-skip to next
+}
+au.addEventListener('ended', () => { if (auto) nextTrack(1); });
+au.addEventListener('error', () => skipFail());
+au.addEventListener('playing', () => { fails = 0; });
+
+ $('pgp').onclick = () => { if (p > 0){ p--; draw(); } };
+ $('pgn').onclick = () => { if ((p+1)*PER < F.length){ p++; draw(); } };
+ $('skip').onclick = () => nextTrack(1);
+ $('rnd').onclick  = () => { setMode('random'); nextTrack(1); };
+ $('mode').onclick = () => setMode(mode === 'order' ? 'random' : 'order');
+ $('auto').onclick = () => {
+  auto = !auto;
+  $('auto').innerHTML = 'Auto ' + (auto ? '&#10003;' : '&#10007;');
+};
+ $('more').onclick = async () => { await more(10); flt(); };
+ $('q').oninput = flt;
+setMode('order');
+(async () => {
+  M = await (await fetch('data/manifest.json')).json();
+  M.loaded = {};
+  await chunk(0); await chunk(1);
+  flt();
+})();
+</script></body></html>
