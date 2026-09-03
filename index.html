@@ -39,16 +39,14 @@ cursor:pointer;overflow:hidden}.c:hover{border-color:#556}.c.now{border-color:#4
 <script>
 const PROXY = ""; // if Chrome fails playback (CORS): "https://corsproxy.io/?url="
 let M, T = [], F = [], p = 0, hls = null;
-let mode = "order";        // "order" | "random"
-let auto = true;           // continue when a track ends
-let curT = null;           // current track
-let history = [], hIdx = -1;   // play history for Prev
+let mode = "order", auto = true, curT = null;
+let history = [], hIdx = -1;
 let fails = 0, lastSkip = 0, dlBusy = false;
 const PER = 60;
 const au = document.getElementById('au');
 const $ = id => document.getElementById(id);
 const st = t => $('st').textContent = t;
-const seen = new Set();    // guard: a track ID can never enter T twice
+const seen = new Set();
 
 // ---------- chunk loading (race-proof) ----------
 function chunk(i){
@@ -192,38 +190,70 @@ au.addEventListener('ended', () => { if (auto) nextTrack(1); });
 au.addEventListener('error', () => skipFail());
 au.addEventListener('playing', () => { fails = 0; });
 
-// ---------- ffmpeg.wasm MP3 encoder (lazy-loaded, one time) ----------
-const FF_LIB = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js";
-const FF_CORE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js";
-let ffInst = null, ffFailed = false;
+// ---------- ffmpeg.wasm encoder: self-hosted first, then CDNs ----------
+const FF_SOURCES = [
+  { label: "self-hosted",
+    lib:  new URL("ff/ffmpeg.min.js", location.href).href,
+    core: new URL("ff/ffmpeg-core.js", location.href).href },
+  { label: "jsdelivr CDN",
+    lib:  "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js",
+    core: "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js" },
+  { label: "unpkg CDN",
+    lib:  "https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js",
+    core: "https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js" },
+];
+let ffInst = null, ffErr = null;
+
 function loadScript(src){
   return new Promise((res, rej) => {
     const s = document.createElement('script');
-    s.src = src; s.onload = res; s.onerror = () => rej(new Error('script load failed'));
+    s.src = src;
+    s.onload = () => res();
+    s.onerror = () => rej(new Error('script failed: ' + src));
     document.head.appendChild(s);
   });
 }
+function withTimeout(p, ms, msg){
+  return Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))
+  ]);
+}
 async function getFFmpeg(t){
   if (ffInst) return ffInst;
-  if (ffFailed) return null;
-  $('info').textContent = 'Loading MP3 encoder (first time only, ~25 MB)...';
-  try {
-    if (!window.FFmpeg) await loadScript(FF_LIB);
-    ffInst = window.FFmpeg.createFFmpeg({
-      log: false,
-      corePath: FF_CORE,
-      progress: ({ratio}) => {
-        if (t && isFinite(ratio))
-          $('info').textContent = 'Encoding MP3... ' +
-            Math.max(0, Math.min(100, Math.round(ratio * 100))) + '%';
-      }
-    });
-    await ffInst.load();
-    return ffInst;
-  } catch (e) {
-    ffFailed = true; ffInst = null;
-    return null;
+  for (const src of FF_SOURCES){
+    const t0 = Date.now();
+    try {
+      $('info').textContent = 'Loading MP3 encoder (' + src.label
+        + ', first time ~25 MB)...';
+      if (!window.FFmpeg || typeof window.FFmpeg.createFFmpeg !== 'function')
+        await loadScript(src.lib);
+      if (!window.FFmpeg || typeof window.FFmpeg.createFFmpeg !== 'function')
+        throw new Error('FFmpeg library loaded but createFFmpeg is missing');
+      const ff = window.FFmpeg.createFFmpeg({
+        log: false,
+        corePath: src.core,
+        progress: ({ratio}) => {
+          if (t && isFinite(ratio) && ratio > 0)
+            $('info').textContent = 'Encoding MP3... '
+              + Math.min(100, Math.round(ratio * 100)) + '%';
+        }
+      });
+      await withTimeout(ff.load(), 180000,
+                        'encoder load timed out (3 min) - network too slow?');
+      ffInst = ff;
+      console.log('MP3 encoder ready from ' + src.label + ' in '
+        + ((Date.now() - t0) / 1000).toFixed(1) + 's');
+      return ff;
+    } catch (e) {
+      ffErr = e;
+      console.error('encoder source failed (' + src.label + '):', e);
+    }
   }
+  const msg = ffErr && ffErr.message ? ffErr.message : 'unknown error';
+  $('info').textContent = 'MP3 encoder failed (' + msg.slice(0, 90)
+    + '). Saving .ts instead. Press F12 > Console for details.';
+  return null;
 }
 function saveBlob(blob, name){
   const a = document.createElement('a');
@@ -233,7 +263,7 @@ function saveBlob(blob, name){
   setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 }
 
-// ---------- download (fetch HLS -> ffmpeg.wasm -> .mp3) ----------
+// ---------- download (fetch HLS -> ffmpeg -> .mp3) ----------
 async function fetchBuf(u){
   const r = await fetch(u);
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -246,7 +276,6 @@ async function downloadTrack(t){
                     .replace(/\s+/g, ' ').trim().slice(0, 100) || 'track';
   const P = u => PROXY ? PROXY + encodeURIComponent(u) : u;
   try {
-    // 1) fetch playlist + segments
     let url = t.u;
     let lines = (await (await fetch(P(url))).text())
                 .split('\n').map(s => s.trim()).filter(Boolean);
@@ -288,7 +317,6 @@ async function downloadTrack(t){
                          {type: 'video/mp2t'});
     const base = safe(t.t) + ' [' + t.i + ']';
 
-    // 2) transcode to mp3 with ffmpeg.wasm
     const ff = await getFFmpeg(t);
     if (ff){
       const inName = mapBytes ? 'in.mp4' : 'in.ts';
@@ -306,12 +334,11 @@ async function downloadTrack(t){
           + (out.length / 1048576).toFixed(1) + ' MB)';
         return;
       } catch (e) {
-        $('info').textContent = 'MP3 encoding failed - saving raw .ts instead.';
+        console.error('mp3 encode failed:', e);
+        $('info').textContent = 'MP3 encoding failed ('
+          + String(e.message || e).slice(0, 60) + ') - saving raw .ts instead.';
       }
-    } else {
-      $('info').textContent = 'Encoder unavailable - saving raw .ts instead.';
     }
-    // 3) fallback: raw MPEG-TS (plays in VLC)
     saveBlob(raw, base + '.ts');
   } catch (e) {
     $('info').textContent = 'Download failed: ' + e.message
