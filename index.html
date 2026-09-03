@@ -17,44 +17,62 @@ gap:8px;padding:12px}
 .c{background:#17171b;border:1px solid #26262c;border-radius:8px;padding:10px;
 cursor:pointer;overflow:hidden}.c:hover{border-color:#556}.c.now{border-color:#4a8cff}
 .c b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.c i{color:#889;font-size:12px;font-style:normal}
-#pg{text-align:center;color:#889;padding:8px 0 30px}
+.c .id{color:#889;font-size:12px}
+.c .dl{float:right;color:#678;font-size:14px;padding:0 4px}
+.c .dl:hover{color:#fff}
+#pgbar{text-align:center;color:#889;padding:8px 0 30px}
 #st{color:#889;font-size:12px}
 </style></head><body>
 <header><input id="q" type="search" placeholder="Search loaded tracks...">
 <button id="pgp" title="Previous page">&#9664; pg</button>
 <button id="pgn" title="Next page">pg &#9654;</button>
-<button id="skip" title="Next track">&#9197; Next</button>
+<button id="prev" title="Previous song">&#9198; Prev</button>
+<button id="skip" title="Next song">&#9197; Next</button>
 <button id="rnd" title="Shuffle mode">&#128256; Random</button>
 <button id="mode" title="Toggle continuation mode">&#9654; Order</button>
 <button id="auto" title="Autoplay continuation on/off">Auto &#10003;</button>
+<button id="dl" title="Download current song">&#11015; Download</button>
 <button id="more">+10 chunks</button><span id="st"></span></header>
 <audio id="au" controls preload="none"></audio>
 <div id="info">Click a track - playback continues automatically.</div>
-<div id="list"></div><div id="pg"></div>
+<div id="list"></div><div id="pgbar"></div>
 <script>
 const PROXY = ""; // if Chrome fails playback (CORS): "https://corsproxy.io/?url="
 let M, T = [], F = [], p = 0, hls = null;
-let mode = "order";      // "order" = play list top-to-bottom, "random" = shuffle
-let auto = true;         // continue to the next track when one ends
-let curT = null;         // currently playing track object
-let fails = 0, lastSkip = 0;
+let mode = "order";        // "order" | "random"
+let auto = true;           // continue when a track ends
+let curT = null;           // current track
+let history = [], hIdx = -1;   // play history for Prev
+let fails = 0, lastSkip = 0, dlBusy = false;
 const PER = 60;
 const au = document.getElementById('au');
 const $ = id => document.getElementById(id);
 const st = t => $('st').textContent = t;
+const seen = new Set();    // guard: a track ID can never enter T twice
 
-async function chunk(i){
-  if (i < 0 || i >= M.chunks.length || M.loaded[i]) return;
-  const d = await (await fetch('data/' + M.chunks[i])).json();
-  T = T.concat(d); M.loaded[i] = 1;
-  st(T.length.toLocaleString() + ' / ' + M.total.toLocaleString() + ' loaded');
+// ---------- chunk loading (race-proof: in-flight promise + ID dedupe) ----------
+function chunk(i){
+  if (i < 0 || i >= M.chunks.length) return Promise.resolve(false);
+  if (M.loaded[i]) return M.loaded[i];          // loading, or already loaded
+  M.loaded[i] = (async () => {                   // set SYNCHRONOUSLY -> no double load
+    try {
+      const r = await fetch('data/' + M.chunks[i]);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      for (const t of d) if (!seen.has(t.i)){ seen.add(t.i); T.push(t); }
+      st(T.length.toLocaleString() + ' / ' + M.total.toLocaleString() + ' loaded');
+      return true;
+    } catch (e) { M.loaded[i] = 0; return false; }   // failed -> retry allowed
+  })();
+  return M.loaded[i];
 }
 async function more(n){
   let k = 0;
   for (let i = 0; i < M.chunks.length && k < n; i++)
-    if (!M.loaded[i]) { await chunk(i); k++; }
+    if (!M.loaded[i]) { if (await chunk(i)) k++; }
 }
+
+// ---------- list / filter ----------
 function applyFilter(){
   const q = $('q').value.trim().toLowerCase();
   F = q ? T.filter(t => t.t.toLowerCase().includes(q)) : T;
@@ -65,23 +83,33 @@ function draw(){
   const s = p * PER;
   for (const t of F.slice(s, s + PER)){
     const d = document.createElement('div'); d.className = 'c'; d.dataset.i = t.i;
+    const dl = document.createElement('span'); dl.className = 'dl';
+    dl.textContent = '\u2b07'; dl.title = 'Download this track';
+    dl.onclick = ev => { ev.stopPropagation(); downloadTrack(t); };
     const b = document.createElement('b'); b.textContent = t.t;
-    const i = document.createElement('i'); i.textContent = t.i;
-    d.append(b, i);
+    const it = document.createElement('span'); it.className = 'id'; it.textContent = t.i;
+    d.append(dl, b, it);
     d.onclick = () => { setMode('order'); play(t, d); };
     el.appendChild(d);
   }
-  $('pg').textContent = F.length
+  $('pgbar').textContent = F.length
     ? (s+1) + '-' + Math.min(s+PER, F.length) + ' of '
       + F.length.toLocaleString() + ' loaded (page ' + (p+1) + ')'
     : 'no matches';
 }
+
+// ---------- playback ----------
 function setMode(m){
   mode = m;
   $('mode').innerHTML = m === 'order' ? '&#9654; Order' : '&#128256; Random';
 }
-function play(t, card){
+function play(t, card, fromHistory){
   curT = t;
+  if (!fromHistory){
+    history = history.slice(0, hIdx + 1);       // truncate forward history
+    history.push(t); hIdx = history.length - 1;
+    if (history.length > 500){ history.shift(); hIdx--; }
+  }
   document.querySelectorAll('.c.now').forEach(c => c.classList.remove('now'));
   const sel = '.c[data-i="' + CSS.escape(String(t.i)) + '"]';
   const el = card || document.querySelector(sel);
@@ -98,9 +126,13 @@ function play(t, card){
     au.play().catch(()=>{});
   } else $('info').textContent = 'No HLS support in this browser.';
 }
+function gotoInList(t){
+  const idx = F.indexOf(t);
+  if (idx >= 0){ p = Math.floor(idx / PER); draw(); }
+}
 async function nextTrack(dir = 1){
   if (!F.length){
-    if ($('q').value){ $('q').value = ''; }
+    if ($('q').value) $('q').value = '';
     applyFilter();
     if (!F.length) return;
   }
@@ -115,21 +147,37 @@ async function nextTrack(dir = 1){
   let target = idx + dir;
   if (target >= F.length){
     const i = M.chunks.findIndex((_, j) => !M.loaded[j]);
-    if (i >= 0){                       // ran out of loaded tracks - load one more chunk
+    if (i >= 0){
       await chunk(i);
       applyFilter();
       idx = curT ? F.indexOf(curT) : -1;
       target = idx === -1 ? 0 : idx + dir;
     }
-    if (target >= F.length) target = 0;  // everything loaded -> wrap to start
+    if (target >= F.length) target = 0;          // all loaded -> wrap
   }
   if (target < 0) target = F.length - 1;
-  p = Math.floor(target / PER);          // follow the playing track in the list
-  draw();
+  p = Math.floor(target / PER); draw();
   play(F[target]);
 }
+function prevTrack(){
+  if (hIdx > 0){                                  // step back through history
+    hIdx--;
+    const t = history[hIdx];
+    gotoInList(t);
+    play(t, null, true);
+    return;
+  }
+  if (mode === 'order' && F.length){              // no history yet -> list order
+    let idx = curT ? F.indexOf(curT) : 0;
+    let target = idx <= 0 ? F.length - 1 : idx - 1;
+    p = Math.floor(target / PER); draw();
+    play(F[target]);
+    return;
+  }
+  $('info').textContent = 'No previous track yet.';
+}
 function skipFail(){
-  if (Date.now() - lastSkip < 500) return;  // one skip per failure, not two
+  if (Date.now() - lastSkip < 500) return;
   lastSkip = Date.now();
   fails++;
   if (!auto || fails > 5){
@@ -138,14 +186,85 @@ function skipFail(){
       : 'Playback failed (CORS or dead link).';
     return;
   }
-  setTimeout(() => nextTrack(1), 700);   // dead link -> auto-skip to next
+  setTimeout(() => nextTrack(1), 700);            // dead link -> auto-skip
 }
 au.addEventListener('ended', () => { if (auto) nextTrack(1); });
 au.addEventListener('error', () => skipFail());
 au.addEventListener('playing', () => { fails = 0; });
 
+// ---------- download (fetches all HLS segments -> one file) ----------
+async function fetchText(u){
+  const r = await fetch(u);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.text();
+}
+async function downloadTrack(t){
+  if (dlBusy){ $('info').textContent = 'A download is already running.'; return; }
+  dlBusy = true;
+  const safe = s => (s || 'track').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+                    .replace(/\s+/g, ' ').trim().slice(0, 100) || 'track';
+  const file = safe(t.t) + ' [' + t.i + '].ts';
+  const P = u => PROXY ? PROXY + encodeURIComponent(u) : u;
+  try {
+    let url = t.u;
+    let lines = (await fetchText(P(url))).split('\n').map(s => s.trim()).filter(Boolean);
+    if (lines.some(l => l.startsWith('#EXT-X-STREAM-INF'))){    // master playlist
+      const k = lines.findIndex(l => l.startsWith('#EXT-X-STREAM-INF'));
+      url = new URL(lines[k+1], url).href;
+      lines = (await fetchText(P(url))).split('\n').map(s => s.trim()).filter(Boolean);
+    }
+    if (lines.some(l => l.startsWith('#EXT-X-KEY'))){
+      $('info').textContent = 'Stream is encrypted - cannot download.';
+      return;
+    }
+    let mapBytes = null;                                        // fMP4 init segment
+    const mapLine = lines.find(l => l.startsWith('#EXT-X-MAP'));
+    if (mapLine){
+      const mu = (mapLine.match(/URI="([^"]+)"/) || [])[1];
+      if (mu){
+        const r = await fetch(P(new URL(mu, url).href));
+        mapBytes = new Uint8Array(await r.arrayBuffer());
+      }
+    }
+    const segs = lines.filter(l => !l.startsWith('#')).map(l => new URL(l, url).href);
+    if (!segs.length){ $('info').textContent = 'No segments found.'; return; }
+    const parts = new Array(segs.length);
+    let done = 0, next = 0;
+    async function worker(){
+      while (next < segs.length){
+        const i = next++;
+        for (let a = 0; a < 3; a++){
+          try {
+            const r = await fetch(P(segs[i]));
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            parts[i] = new Uint8Array(await r.arrayBuffer());
+            break;
+          } catch(e){ if (a === 2) parts[i] = new Uint8Array(0); }
+        }
+        done++;
+        $('info').textContent = 'Downloading "' + t.t + '" - '
+          + done + '/' + segs.length + ' segments...';
+      }
+    }
+    await Promise.all(Array.from({length: 6}, worker));
+    const blob = new Blob(mapBytes ? [mapBytes, ...parts] : parts, {type: 'video/mp2t'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = file;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    $('info').textContent = 'Saved ' + file + ' ('
+      + (blob.size / 1048576).toFixed(1) + ' MB)';
+  } catch (e) {
+    $('info').textContent = 'Download failed: ' + e.message
+      + (PROXY ? '' : ' (CORS? set PROXY at top of script)');
+  } finally { dlBusy = false; }
+}
+
+// ---------- wiring ----------
  $('pgp').onclick = () => { if (p > 0){ p--; draw(); } };
  $('pgn').onclick = () => { if ((p+1)*PER < F.length){ p++; draw(); } };
+ $('prev').onclick = prevTrack;
  $('skip').onclick = () => nextTrack(1);
  $('rnd').onclick  = () => { setMode('random'); nextTrack(1); };
  $('mode').onclick = () => setMode(mode === 'order' ? 'random' : 'order');
@@ -153,6 +272,8 @@ au.addEventListener('playing', () => { fails = 0; });
   auto = !auto;
   $('auto').innerHTML = 'Auto ' + (auto ? '&#10003;' : '&#10007;');
 };
+ $('dl').onclick = () => { if (curT) downloadTrack(curT);
+  else $('info').textContent = 'Play a track first.'; };
  $('more').onclick = async () => { await more(10); flt(); };
  $('q').oninput = flt;
 setMode('order');
