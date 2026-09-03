@@ -31,7 +31,7 @@ cursor:pointer;overflow:hidden}.c:hover{border-color:#556}.c.now{border-color:#4
 <button id="rnd" title="Shuffle mode">&#128256; Random</button>
 <button id="mode" title="Toggle continuation mode">&#9654; Order</button>
 <button id="auto" title="Autoplay continuation on/off">Auto &#10003;</button>
-<button id="dl" title="Download current song">&#11015; Download</button>
+<button id="dl" title="Download current song as MP3">&#11015; MP3</button>
 <button id="more">+10 chunks</button><span id="st"></span></header>
 <audio id="au" controls preload="none"></audio>
 <div id="info">Click a track - playback continues automatically.</div>
@@ -50,11 +50,11 @@ const $ = id => document.getElementById(id);
 const st = t => $('st').textContent = t;
 const seen = new Set();    // guard: a track ID can never enter T twice
 
-// ---------- chunk loading (race-proof: in-flight promise + ID dedupe) ----------
+// ---------- chunk loading (race-proof) ----------
 function chunk(i){
   if (i < 0 || i >= M.chunks.length) return Promise.resolve(false);
-  if (M.loaded[i]) return M.loaded[i];          // loading, or already loaded
-  M.loaded[i] = (async () => {                   // set SYNCHRONOUSLY -> no double load
+  if (M.loaded[i]) return M.loaded[i];
+  M.loaded[i] = (async () => {
     try {
       const r = await fetch('data/' + M.chunks[i]);
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -62,7 +62,7 @@ function chunk(i){
       for (const t of d) if (!seen.has(t.i)){ seen.add(t.i); T.push(t); }
       st(T.length.toLocaleString() + ' / ' + M.total.toLocaleString() + ' loaded');
       return true;
-    } catch (e) { M.loaded[i] = 0; return false; }   // failed -> retry allowed
+    } catch (e) { M.loaded[i] = 0; return false; }
   })();
   return M.loaded[i];
 }
@@ -84,7 +84,7 @@ function draw(){
   for (const t of F.slice(s, s + PER)){
     const d = document.createElement('div'); d.className = 'c'; d.dataset.i = t.i;
     const dl = document.createElement('span'); dl.className = 'dl';
-    dl.textContent = '\u2b07'; dl.title = 'Download this track';
+    dl.textContent = '\u2b07'; dl.title = 'Download as MP3';
     dl.onclick = ev => { ev.stopPropagation(); downloadTrack(t); };
     const b = document.createElement('b'); b.textContent = t.t;
     const it = document.createElement('span'); it.className = 'id'; it.textContent = t.i;
@@ -106,7 +106,7 @@ function setMode(m){
 function play(t, card, fromHistory){
   curT = t;
   if (!fromHistory){
-    history = history.slice(0, hIdx + 1);       // truncate forward history
+    history = history.slice(0, hIdx + 1);
     history.push(t); hIdx = history.length - 1;
     if (history.length > 500){ history.shift(); hIdx--; }
   }
@@ -153,21 +153,21 @@ async function nextTrack(dir = 1){
       idx = curT ? F.indexOf(curT) : -1;
       target = idx === -1 ? 0 : idx + dir;
     }
-    if (target >= F.length) target = 0;          // all loaded -> wrap
+    if (target >= F.length) target = 0;
   }
   if (target < 0) target = F.length - 1;
   p = Math.floor(target / PER); draw();
   play(F[target]);
 }
 function prevTrack(){
-  if (hIdx > 0){                                  // step back through history
+  if (hIdx > 0){
     hIdx--;
     const t = history[hIdx];
     gotoInList(t);
     play(t, null, true);
     return;
   }
-  if (mode === 'order' && F.length){              // no history yet -> list order
+  if (mode === 'order' && F.length){
     let idx = curT ? F.indexOf(curT) : 0;
     let target = idx <= 0 ? F.length - 1 : idx - 1;
     p = Math.floor(target / PER); draw();
@@ -186,47 +186,88 @@ function skipFail(){
       : 'Playback failed (CORS or dead link).';
     return;
   }
-  setTimeout(() => nextTrack(1), 700);            // dead link -> auto-skip
+  setTimeout(() => nextTrack(1), 700);
 }
 au.addEventListener('ended', () => { if (auto) nextTrack(1); });
 au.addEventListener('error', () => skipFail());
 au.addEventListener('playing', () => { fails = 0; });
 
-// ---------- download (fetches all HLS segments -> one file) ----------
-async function fetchText(u){
+// ---------- ffmpeg.wasm MP3 encoder (lazy-loaded, one time) ----------
+const FF_LIB = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js";
+const FF_CORE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js";
+let ffInst = null, ffFailed = false;
+function loadScript(src){
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res; s.onerror = () => rej(new Error('script load failed'));
+    document.head.appendChild(s);
+  });
+}
+async function getFFmpeg(t){
+  if (ffInst) return ffInst;
+  if (ffFailed) return null;
+  $('info').textContent = 'Loading MP3 encoder (first time only, ~25 MB)...';
+  try {
+    if (!window.FFmpeg) await loadScript(FF_LIB);
+    ffInst = window.FFmpeg.createFFmpeg({
+      log: false,
+      corePath: FF_CORE,
+      progress: ({ratio}) => {
+        if (t && isFinite(ratio))
+          $('info').textContent = 'Encoding MP3... ' +
+            Math.max(0, Math.min(100, Math.round(ratio * 100))) + '%';
+      }
+    });
+    await ffInst.load();
+    return ffInst;
+  } catch (e) {
+    ffFailed = true; ffInst = null;
+    return null;
+  }
+}
+function saveBlob(blob, name){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+
+// ---------- download (fetch HLS -> ffmpeg.wasm -> .mp3) ----------
+async function fetchBuf(u){
   const r = await fetch(u);
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.text();
+  return new Uint8Array(await r.arrayBuffer());
 }
 async function downloadTrack(t){
   if (dlBusy){ $('info').textContent = 'A download is already running.'; return; }
   dlBusy = true;
   const safe = s => (s || 'track').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
                     .replace(/\s+/g, ' ').trim().slice(0, 100) || 'track';
-  const file = safe(t.t) + ' [' + t.i + '].ts';
   const P = u => PROXY ? PROXY + encodeURIComponent(u) : u;
   try {
+    // 1) fetch playlist + segments
     let url = t.u;
-    let lines = (await fetchText(P(url))).split('\n').map(s => s.trim()).filter(Boolean);
-    if (lines.some(l => l.startsWith('#EXT-X-STREAM-INF'))){    // master playlist
+    let lines = (await (await fetch(P(url))).text())
+                .split('\n').map(s => s.trim()).filter(Boolean);
+    if (lines.some(l => l.startsWith('#EXT-X-STREAM-INF'))){
       const k = lines.findIndex(l => l.startsWith('#EXT-X-STREAM-INF'));
-      url = new URL(lines[k+1], url).href;
-      lines = (await fetchText(P(url))).split('\n').map(s => s.trim()).filter(Boolean);
+      url = new URL(lines[k + 1], url).href;
+      lines = (await (await fetch(P(url))).text())
+              .split('\n').map(s => s.trim()).filter(Boolean);
     }
     if (lines.some(l => l.startsWith('#EXT-X-KEY'))){
       $('info').textContent = 'Stream is encrypted - cannot download.';
       return;
     }
-    let mapBytes = null;                                        // fMP4 init segment
+    let mapBytes = null;
     const mapLine = lines.find(l => l.startsWith('#EXT-X-MAP'));
     if (mapLine){
       const mu = (mapLine.match(/URI="([^"]+)"/) || [])[1];
-      if (mu){
-        const r = await fetch(P(new URL(mu, url).href));
-        mapBytes = new Uint8Array(await r.arrayBuffer());
-      }
+      if (mu) mapBytes = await fetchBuf(P(new URL(mu, url).href));
     }
-    const segs = lines.filter(l => !l.startsWith('#')).map(l => new URL(l, url).href);
+    const segs = lines.filter(l => !l.startsWith('#'))
+                      .map(l => new URL(l, url).href);
     if (!segs.length){ $('info').textContent = 'No segments found.'; return; }
     const parts = new Array(segs.length);
     let done = 0, next = 0;
@@ -234,27 +275,44 @@ async function downloadTrack(t){
       while (next < segs.length){
         const i = next++;
         for (let a = 0; a < 3; a++){
-          try {
-            const r = await fetch(P(segs[i]));
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            parts[i] = new Uint8Array(await r.arrayBuffer());
-            break;
-          } catch(e){ if (a === 2) parts[i] = new Uint8Array(0); }
+          try { parts[i] = await fetchBuf(P(segs[i])); break; }
+          catch (e){ if (a === 2) parts[i] = new Uint8Array(0); }
         }
         done++;
-        $('info').textContent = 'Downloading "' + t.t + '" - '
+        $('info').textContent = 'Fetching "' + t.t + '" - '
           + done + '/' + segs.length + ' segments...';
       }
     }
     await Promise.all(Array.from({length: 6}, worker));
-    const blob = new Blob(mapBytes ? [mapBytes, ...parts] : parts, {type: 'video/mp2t'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = file;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-    $('info').textContent = 'Saved ' + file + ' ('
-      + (blob.size / 1048576).toFixed(1) + ' MB)';
+    const raw = new Blob(mapBytes ? [mapBytes, ...parts] : parts,
+                         {type: 'video/mp2t'});
+    const base = safe(t.t) + ' [' + t.i + ']';
+
+    // 2) transcode to mp3 with ffmpeg.wasm
+    const ff = await getFFmpeg(t);
+    if (ff){
+      const inName = mapBytes ? 'in.mp4' : 'in.ts';
+      try {
+        ff.FS('writeFile', inName, new Uint8Array(await raw.arrayBuffer()));
+        await ff.run('-i', inName,
+                     '-vn', '-c:a', 'libmp3lame', '-b:a', '192k',
+                     '-id3v2_version', '3',
+                     '-metadata', 'title=' + t.t,
+                     'out.mp3');
+        const out = ff.FS('readFile', 'out.mp3');
+        try { ff.FS('unlink', inName); ff.FS('unlink', 'out.mp3'); } catch (e) {}
+        saveBlob(new Blob([out.buffer], {type: 'audio/mpeg'}), base + '.mp3');
+        $('info').textContent = 'Saved ' + base + '.mp3 ('
+          + (out.length / 1048576).toFixed(1) + ' MB)';
+        return;
+      } catch (e) {
+        $('info').textContent = 'MP3 encoding failed - saving raw .ts instead.';
+      }
+    } else {
+      $('info').textContent = 'Encoder unavailable - saving raw .ts instead.';
+    }
+    // 3) fallback: raw MPEG-TS (plays in VLC)
+    saveBlob(raw, base + '.ts');
   } catch (e) {
     $('info').textContent = 'Download failed: ' + e.message
       + (PROXY ? '' : ' (CORS? set PROXY at top of script)');
