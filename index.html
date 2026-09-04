@@ -1,6 +1,7 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Free Trap Beats (No Vocals)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ctext y='19' font-size='20'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E">
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 <style>
 body{font-family:system-ui,sans-serif;background:#0e0e10;color:#eee;margin:0}
@@ -190,17 +191,20 @@ au.addEventListener('ended', () => { if (auto) nextTrack(1); });
 au.addEventListener('error', () => skipFail());
 au.addEventListener('playing', () => { fails = 0; });
 
-// ---------- ffmpeg.wasm encoder: self-hosted first, then CDNs ----------
+// ---------- ffmpeg.wasm encoder ----------
+// FIX: single-threaded core (@ffmpeg/core-st) + mainName:'main'.
+// The multi-threaded core (@ffmpeg/core) needs SharedArrayBuffer +
+// COOP/COEP headers, which GitHub Pages cannot send.
 const FF_SOURCES = [
   { label: "self-hosted",
     lib:  new URL("ff/ffmpeg.min.js", location.href).href,
     core: new URL("ff/ffmpeg-core.js", location.href).href },
   { label: "jsdelivr CDN",
     lib:  "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js",
-    core: "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js" },
+    core: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
   { label: "unpkg CDN",
     lib:  "https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js",
-    core: "https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js" },
+    core: "https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
 ];
 let ffInst = null, ffErr = null;
 
@@ -233,6 +237,7 @@ async function getFFmpeg(t){
       const ff = window.FFmpeg.createFFmpeg({
         log: false,
         corePath: src.core,
+        mainName: 'main',          // required by the single-threaded core
         progress: ({ratio}) => {
           if (t && isFinite(ratio) && ratio > 0)
             $('info').textContent = 'Encoding MP3... '
