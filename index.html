@@ -191,24 +191,39 @@ au.addEventListener('ended', () => { if (auto) nextTrack(1); });
 au.addEventListener('error', () => skipFail());
 au.addEventListener('playing', () => { fails = 0; });
 
-// ---------- MP3 encoder ----------
-// FIX for "da" / "can only run one command at a time":
-// a FRESH ffmpeg instance (new worker + wasm) is created for every download
-// and terminated afterwards - the 0.11 wasm module cannot be safely reused
-// across many commands, which crashed the 2nd download and wedged the flag.
-const FF_LIB_URLS = [
-  "ff/ffmpeg.min.js",  // self-hosted if you pushed it (404 here is harmless)
-  "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js",
-  "https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js",
-];
-let coreOrder = [
+// ---------- MP3 encoder: PROBE every source before using it ----------
+// A 404 from GitHub Pages is an HTML page; if the ffmpeg loader fetches it,
+// it tries to execute HTML as JavaScript -> uncaught errors OUTSIDE the
+// promise chain -> ff.load() hangs forever. Probing with HEAD first means
+// dead URLs are skipped in milliseconds and never reach the loader.
+const FF_LIB_CANDIDATES = [
   { label: "self-hosted",
-    core: new URL("ff/ffmpeg-core.js", location.href).href },
+    url: new URL("ff/ffmpeg.min.js", location.href).href },
   { label: "jsdelivr CDN",
-    core: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
+    url: "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" },
   { label: "unpkg CDN",
-    core: "https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
+    url: "https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" },
 ];
+const FF_CORE_CANDIDATES = [   // single-threaded core - no SharedArrayBuffer needed
+  { label: "self-hosted",
+    url: new URL("ff/ffmpeg-core.js", location.href).href },
+  { label: "jsdelivr CDN",
+    url: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
+  { label: "unpkg CDN",
+    url: "https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
+];
+const probeCache = {};
+let aliveCores = null, coreRotate = 0;
+
+async function probe(url){
+  if (url in probeCache) return probeCache[url];
+  let ok = false;
+  try { ok = (await fetch(url, {method: 'HEAD'})).ok; }
+  catch (_) { ok = false; }
+  probeCache[url] = ok;
+  if (!ok) console.log('encoder source missing, skipping:', url);
+  return ok;
+}
 function loadScript(src){
   return new Promise((res, rej) => {
     const s = document.createElement('script');
@@ -225,41 +240,63 @@ function withTimeout(p, ms, msg){
 }
 async function ensureLib(){
   if (window.FFmpeg && typeof window.FFmpeg.createFFmpeg === 'function') return true;
-  for (const u of FF_LIB_URLS){
-    try { await withTimeout(loadScript(u), 60000, 'lib load timeout'); }
-    catch (e) { console.error('ffmpeg library failed (' + u + '):', e); }
-    if (window.FFmpeg && typeof window.FFmpeg.createFFmpeg === 'function') return true;
+  for (const c of FF_LIB_CANDIDATES){
+    if (!(await probe(c.url))) continue;          // skip dead sources instantly
+    try { await withTimeout(loadScript(c.url), 60000, 'library load timeout'); }
+    catch (e){ console.error('library failed (' + c.label + '):', e); continue; }
+    if (window.FFmpeg && typeof window.FFmpeg.createFFmpeg === 'function'){
+      console.log('ffmpeg library loaded from ' + c.label);
+      return true;
+    }
   }
   return false;
 }
+async function getAliveCores(){
+  if (aliveCores) return aliveCores;
+  const list = [];
+  for (const c of FF_CORE_CANDIDATES)
+    if (await probe(c.url)) list.push(c);
+  // last resort: if every probe failed (weird network), try the CDNs anyway
+  aliveCores = list.length
+    ? list
+    : FF_CORE_CANDIDATES.filter(c => c.label !== 'self-hosted');
+  return aliveCores;
+}
 async function createEncoderInstance(onProgress){
-  // returns {ff, src} with a loaded, NEVER-BEFORE-USED instance, or null
   if (!(await ensureLib())){
     $('info').textContent = 'Could not load the MP3 encoder library.';
     return null;
   }
-  while (coreOrder.length){
-    const src = coreOrder[0];
+  const cores = await getAliveCores();
+  for (let i = 0; i < cores.length; i++){
+    const k = (i + coreRotate) % cores.length;    // rotation: retry tries next source
+    const src = cores[k];
     let ff = null;
     try {
       ff = window.FFmpeg.createFFmpeg({
         log: false,
-        corePath: src.core,
+        corePath: src.core || src.url,
         mainName: 'main',
         progress: onProgress
       });
-      await withTimeout(ff.load(), 180000, 'encoder load timed out (3 min)');
+      $('info').textContent = 'Loading MP3 encoder (' + src.label
+        + ', first time this session)...';
+      const p = ff.load();
+      p.catch(()=>{});   // a late rejection must never become unhandled
+      await withTimeout(p, 120000, 'encoder load timed out (2 min)');
+      coreRotate = k;
       console.log('MP3 encoder ready from ' + src.label);
-      return { ff, src };
+      return { ff: ff };
     } catch (e) {
       console.error('encoder source failed (' + src.label + '):', e);
-      if (ff){ try { ff.exit(); } catch (_){} }
-      coreOrder.shift();   // dead source - don't retry it this session
+      if (ff){ try { ff.exit(); } catch (_) {} }
     }
   }
   return null;
 }
-async function encodeToMP3(bytes, inName, title, attempt, useMeta){
+async function encodeToMP3(bytes, inName, title, attempt){
+  // FRESH instance for every encode (the 0.11 wasm module cannot be reused
+  // across commands - that caused "da" + "one command at a time").
   const enc = await createEncoderInstance(({ratio}) => {
     if (isFinite(ratio) && ratio > 0)
       $('info').textContent = 'Encoding MP3 (attempt ' + attempt + ')... '
@@ -271,12 +308,12 @@ async function encodeToMP3(bytes, inName, title, attempt, useMeta){
     ff.FS('writeFile', inName, bytes);
     const args = ['-i', inName, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k',
                   '-id3v2_version', '3'];
-    if (useMeta && title) args.push('-metadata', 'title=' + title);
+    if (attempt === 1 && title) args.push('-metadata', 'title=' + title);
     args.push('out.mp3');
     await ff.run(...args);
     return ff.FS('readFile', 'out.mp3');
   } finally {
-    try { ff.exit(); } catch (_){}   // always kill the worker - no leaks
+    try { ff.exit(); } catch (_) {}   // always kill the worker - no leaks
   }
 }
 function concatU8(arrs){
@@ -348,7 +385,6 @@ async function downloadTrack(t){
       }
     }
     await Promise.all(Array.from({length: 6}, worker));
-    // no intermediate Blob -> less memory pressure (fixes ERR_BLOB_OUT_OF_MEMORY)
     const raw = concatU8(mapBytes ? [mapBytes, ...parts] : parts);
     const inName = mapBytes ? 'in.mp4' : 'in.ts';
     const metaTitle = String(t.t || '')
@@ -357,12 +393,10 @@ async function downloadTrack(t){
     let mp3 = null;
     for (let attempt = 1; attempt <= 2 && !mp3; attempt++){
       try {
-        // attempt 2: fresh instance again + no metadata (most conservative)
-        mp3 = await encodeToMP3(raw, inName, metaTitle, attempt, attempt === 1);
+        mp3 = await encodeToMP3(raw, inName, metaTitle, attempt);
       } catch (e) {
         console.error('mp3 encode attempt ' + attempt + ' failed:', e);
-        if (attempt === 1 && coreOrder.length > 1)
-          coreOrder.push(coreOrder.shift());   // rotate core source for retry
+        coreRotate++;      // next attempt starts from a different encoder source
       }
     }
     if (mp3){
