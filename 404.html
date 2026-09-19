@@ -1,0 +1,362 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Free Trap Beats API</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ctext y='19' font-size='20'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E">
+<style>
+body{font-family:system-ui,sans-serif;background:#0e0e10;color:#eee;margin:0;
+display:flex;min-height:100vh;align-items:center;justify-content:center}
+#box{max-width:760px;width:100%;padding:24px;box-sizing:border-box}
+h1{font-size:22px;margin:0 0 6px}
+#status{color:#8ab4f8;font-size:15px;margin:10px 0;min-height:22px;word-break:break-word}
+#log{background:#17171b;border:1px solid #26262c;border-radius:8px;padding:10px;
+height:300px;overflow-y:auto;font-size:12px;color:#9ab;line-height:1.6}
+#note{color:#889;font-size:12px;margin-top:10px;line-height:1.5}
+.ctrl{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;align-items:center}
+input{padding:8px;background:#1a1a1e;color:#eee;border:1px solid #333;
+border-radius:6px;width:110px}
+button{padding:8px 14px;background:#1a1a1e;color:#eee;border:1px solid #333;
+border-radius:6px;cursor:pointer}button:hover{background:#26262c}
+a{color:#4a8cff;text-decoration:none}
+code{background:#1a1a1e;padding:2px 6px;border-radius:4px;font-size:12px}
+</style></head><body><div id="box">
+<h1 id="title">&#127925; Free Trap Beats API</h1>
+<div id="status">starting...</div>
+<div id="log"></div>
+<div id="note"></div>
+<div class="ctrl" id="ctrl" style="display:none">
+  <input id="cN" type="number" min="1" max="500" placeholder="songs">
+  <button onclick="goCount()">Download N songs</button>
+  <input id="cD" type="number" min="1" placeholder="seconds">
+  <button onclick="goDur()">Fill duration</button>
+  <button onclick="location.href=BASE">Open player</button>
+</div>
+</div>
+<script>
+"use strict";
+const PROXY = ""; // if Chrome fails segment fetches (CORS): "https://corsproxy.io/?url="
+const path = location.pathname;
+// site base: "/beatstarstrapnovocals/" (works for any repo name / local test)
+const BASE = path.includes("/api/")
+  ? path.slice(0, path.indexOf("/api/") + 1)
+  : path.replace(/[^/]*$/, "");
+
+const q = new URLSearchParams(location.search);
+const mDur = path.match(/\/api\/duration\/(\d+(?:\.\d+)?)\/?$/);
+const mCnt = path.match(/\/api\/(\d+)\/?$/);
+let mode = null, value = 0;
+if (mDur){ mode = "duration"; value = parseFloat(mDur[1]); }
+else if (mCnt){ mode = "count"; value = parseInt(mCnt[1], 10); }
+else if (q.get("duration")){ mode = "duration"; value = parseFloat(q.get("duration")); }
+else if (q.get("count")){ mode = "count"; value = parseInt(q.get("count"), 10); }
+
+const MAX_COUNT = 500, MAX_SECONDS = 2592000;  // 500 songs / 30 days per request
+let M = null, chunkCache = {}, used = new Set();
+let songs = 0, totalSec = 0, mp3s = 0, tss = 0;
+
+const $ = id => document.getElementById(id);
+function status(t){ $("status").textContent = t; }
+function log(t){
+  const d = document.createElement("div"); d.textContent = t;
+  const L = $("log"); L.appendChild(d);
+  while (L.children.length > 300) L.removeChild(L.firstChild);
+  L.scrollTop = L.scrollHeight;
+}
+function fmtDur(s){
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return (h ? h + "h " : "") + (m ? m + "m " : "") + (s % 60) + "s";
+}
+function showCtrl(){ $("ctrl").style.display = "flex"; }
+function goCount(){
+  const n = parseInt($("cN").value, 10);
+  if (n > 0) location.href = BASE + "api/" + Math.min(n, MAX_COUNT);
+}
+function goDur(){
+  const s = parseInt($("cD").value, 10);
+  if (s > 0) location.href = BASE + "api/duration/" + Math.min(s, MAX_SECONDS);
+}
+
+// ---------------- random track picker (whole catalog, no repeats) ----------------
+async function pickRandom(){
+  for (let a = 0; a < 30; a++){
+    const ci = Math.floor(Math.random() * M.chunks.length);
+    if (!chunkCache[ci]){
+      try {
+        chunkCache[ci] = await (await fetch(BASE + "data/" + M.chunks[ci])).json();
+      } catch (e){ delete chunkCache[ci]; continue; }
+    }
+    const arr = chunkCache[ci];
+    if (!arr || !arr.length) continue;
+    const t = arr[Math.floor(Math.random() * arr.length)];
+    if (t && t.u && !used.has(t.i)) return t;   // RANDOM pick, deduped
+  }
+  return null;
+}
+
+// ---------------- playlist resolution + duration ----------------
+async function fetchText(u){
+  const r = await fetch(PROXY ? PROXY + encodeURIComponent(u) : u);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.text();
+}
+async function resolvePlaylist(t){
+  try {
+    let url = t.u;
+    let lines = (await fetchText(url)).split("\n").map(s => s.trim()).filter(Boolean);
+    if (lines.some(l => l.startsWith("#EXT-X-STREAM-INF"))){
+      const k = lines.findIndex(l => l.startsWith("#EXT-X-STREAM-INF"));
+      url = new URL(lines[k + 1], url).href;
+      lines = (await fetchText(url)).split("\n").map(s => s.trim()).filter(Boolean);
+    }
+    if (lines.some(l => l.startsWith("#EXT-X-KEY"))) return null;  // encrypted
+    let dur = 0;
+    for (const l of lines)
+      if (l.startsWith("#EXTINF:")) dur += parseFloat(l.slice(8).split(",")[0]) || 0;
+    const segs = lines.filter(l => !l.startsWith("#")).map(l => new URL(l, url).href);
+    if (!segs.length || !dur) return null;
+    let mapUrl = null;
+    const ml = lines.find(l => l.startsWith("#EXT-X-MAP"));
+    if (ml){
+      const mu = (ml.match(/URI="([^"]+)"/) || [])[1];
+      if (mu) mapUrl = new URL(mu, url).href;
+    }
+    return { url: url, duration: dur, segs: segs, mapUrl: mapUrl };
+  } catch (e){ return null; }
+}
+
+// ---------------- MP3 encoder (probed sources, fresh instance per song) ----------------
+const FF_LIB_CANDIDATES = [
+  { label: "self-hosted", url: new URL("ff/ffmpeg.min.js", location.origin + BASE).href },
+  { label: "jsdelivr CDN", url: "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" },
+  { label: "unpkg CDN", url: "https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" },
+];
+const FF_CORE_CANDIDATES = [   // single-threaded core - works on GitHub Pages
+  { label: "self-hosted", url: new URL("ff/ffmpeg-core.js", location.origin + BASE).href },
+  { label: "jsdelivr CDN", url: "https://cdn.jsdelivr.net/npm/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
+  { label: "unpkg CDN", url: "https://unpkg.com/@ffmpeg/core-st@0.11.1/dist/ffmpeg-core.js" },
+];
+const probeCache = {};
+let aliveCores = null, coreRotate = 0;
+
+async function probe(url){
+  if (url in probeCache) return probeCache[url];
+  let ok = false;
+  try { ok = (await fetch(url, {method: "HEAD"})).ok; } catch (_){ ok = false; }
+  probeCache[url] = ok;
+  return ok;
+}
+function loadScript(src){
+  return new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = res;
+    s.onerror = () => rej(new Error("script failed: " + src));
+    document.head.appendChild(s);
+  });
+}
+function withTimeout(p, ms, msg){
+  return Promise.race([p, new Promise((_, rej) =>
+    setTimeout(() => rej(new Error(msg)), ms))]);
+}
+async function ensureLib(){
+  if (window.FFmpeg && typeof window.FFmpeg.createFFmpeg === "function") return true;
+  for (const c of FF_LIB_CANDIDATES){
+    if (!(await probe(c.url))) continue;
+    try { await withTimeout(loadScript(c.url), 60000, "library load timeout"); }
+    catch (e){ continue; }
+    if (window.FFmpeg && typeof window.FFmpeg.createFFmpeg === "function") return true;
+  }
+  return false;
+}
+async function getAliveCores(){
+  if (aliveCores) return aliveCores;
+  const list = [];
+  for (const c of FF_CORE_CANDIDATES) if (await probe(c.url)) list.push(c);
+  aliveCores = list.length ? list
+    : FF_CORE_CANDIDATES.filter(c => c.label !== "self-hosted");
+  return aliveCores;
+}
+async function encodeToMP3(bytes, inName, title, attempt){
+  if (!(await ensureLib())) throw new Error("encoder library unavailable");
+  const cores = await getAliveCores();
+  for (let i = 0; i < cores.length; i++){
+    const src = cores[(i + coreRotate) % cores.length];
+    let ff = null;
+    try {
+      ff = window.FFmpeg.createFFmpeg({
+        log: false, corePath: src.url, mainName: "main",
+        progress: ({ratio}) => {
+          if (isFinite(ratio) && ratio > 0)
+            status("encoding MP3 (attempt " + attempt + ")... "
+              + Math.min(100, Math.round(ratio * 100)) + "%");
+        }
+      });
+      const p = ff.load(); p.catch(()=>{});
+      await withTimeout(p, 120000, "encoder load timed out");
+      ff.FS("writeFile", inName, bytes);
+      const args = ["-i", inName, "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+                    "-id3v2_version", "3"];
+      if (attempt === 1 && title) args.push("-metadata", "title=" + title);
+      args.push("out.mp3");
+      await ff.run(...args);
+      return ff.FS("readFile", "out.mp3");
+    } catch (e) {
+      if (ff){ try { ff.exit(); } catch (_){} }
+      if (i === cores.length - 1) throw e;
+    } finally {
+      if (ff){ try { ff.exit(); } catch (_){} }
+    }
+  }
+  throw new Error("no encoder source worked");
+}
+function concatU8(arrs){
+  let len = 0;
+  for (const a of arrs) len += (a && a.length) || 0;
+  const out = new Uint8Array(len);
+  let off = 0;
+  for (const a of arrs){ if (a && a.length){ out.set(a, off); off += a.length; } }
+  return out;
+}
+function saveBlob(blob, name){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+}
+
+// ---------------- download one song ----------------
+async function fetchBuf(u){
+  const r = await fetch(PROXY ? PROXY + encodeURIComponent(u) : u);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return new Uint8Array(await r.arrayBuffer());
+}
+async function downloadOne(t, res, idx, totalN, target){
+  const safe = (t.t || "track").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+                .replace(/\s+/g, " ").trim().slice(0, 100) || "track";
+  const fname = safe + " [" + t.i + "]";
+  const label = target != null
+    ? Math.round(res.duration) + "s -> total " + Math.round(totalSec + res.duration)
+      + "s / " + target + "s"
+    : "#" + idx + (totalN ? " of " + totalN : "");
+  log("\u25B6 " + fname + "  (" + label + ")");
+  try {
+    const parts = new Array(res.segs.length).fill(null);
+    let done = 0, next = 0;
+    async function worker(){
+      while (next < res.segs.length){
+        const i = next++;
+        for (let a = 0; a < 3; a++){
+          try { parts[i] = await fetchBuf(res.segs[i]); break; }
+          catch (e){ if (a === 2) parts[i] = new Uint8Array(0); }
+        }
+        done++;
+        if (done % 5 === 0 || done === res.segs.length)
+          status("fetching: " + (t.t || "").slice(0, 60)
+            + " (" + done + "/" + res.segs.length + " segments)");
+      }
+    }
+    await Promise.all(Array.from({length: 6}, worker));
+    let mapBytes = null;
+    if (res.mapUrl){ try { mapBytes = await fetchBuf(res.mapUrl); } catch (_){} }
+    const raw = concatU8(mapBytes ? [mapBytes, ...parts] : parts);
+    const inName = mapBytes ? "in.mp4" : "in.ts";
+    const metaTitle = String(t.t || "").replace(/[\r\n\t\x00-\x1f]/g, " ")
+                      .trim().slice(0, 200);
+    let mp3 = null;
+    for (let attempt = 1; attempt <= 2 && !mp3; attempt++){
+      try { mp3 = await encodeToMP3(raw, inName, metaTitle, attempt); }
+      catch (e){ console.error("encode attempt " + attempt, e); coreRotate++; }
+    }
+    if (mp3){
+      saveBlob(new Blob([mp3], {type: "audio/mpeg"}), fname + ".mp3");
+      log("   saved " + fname + ".mp3 (" + (mp3.length / 1048576).toFixed(1) + " MB)");
+      return "mp3";
+    }
+    saveBlob(new Blob([raw], {type: "video/mp2t"}), fname + ".ts");
+    log("   saved " + fname + ".ts (raw - encoder unavailable)");
+    return "ts";
+  } catch (e) {
+    log("   FAILED: " + (e.message || e));
+    return null;
+  }
+}
+
+// ---------------- the two API modes ----------------
+async function runCount(n){
+  let attempts = 0;
+  const maxAtt = n * 5 + 20;
+  while (songs < n && attempts < maxAtt){
+    attempts++;
+    const t = await pickRandom();
+    if (!t){ log("no more unique tracks available"); break; }
+    used.add(t.i);
+    const res = await resolvePlaylist(t);
+    if (!res){ log("skip (dead/encrypted stream): " + (t.t || t.i)); continue; }
+    const kind = await downloadOne(t, res, songs + 1, n, null);
+    if (kind){ songs++; totalSec += res.duration;
+      if (kind === "mp3") mp3s++; else tss++; }
+    status("progress: " + songs + "/" + n + " songs, " + fmtDur(totalSec));
+  }
+}
+async function runDuration(target){
+  let attempts = 0;
+  while (totalSec < target && attempts < 4000){
+    attempts++;
+    const t = await pickRandom();
+    if (!t){ log("no more unique tracks available"); break; }
+    used.add(t.i);
+    const res = await resolvePlaylist(t);
+    if (!res){ log("skip (dead/encrypted stream): " + (t.t || t.i)); continue; }
+    // if this song pushes the total to/past the target, it is the LAST one
+    const kind = await downloadOne(t, res, songs + 1, null, target);
+    if (kind){ songs++; totalSec += res.duration;
+      if (kind === "mp3") mp3s++; else tss++; }
+    else log("hard failure - picking a replacement");
+    status("progress: " + songs + " songs, " + fmtDur(totalSec)
+      + " / " + fmtDur(target));
+  }
+}
+
+// ---------------- boot ----------------
+(async () => {
+  if (!mode){
+    $("title").textContent = "404 - Page not found";
+    status("This page does not exist - but the API does:");
+    log("count mode:    " + BASE + "api/<songs>          e.g. " + BASE + "api/5");
+    log("duration mode: " + BASE + "api/duration/<seconds>   e.g. " + BASE + "api/duration/1200");
+    log("all songs are picked at RANDOM from the whole catalog");
+    $("note").innerHTML = 'Open an API link and the songs download automatically. '
+      + '<a href="' + BASE + '">Back to the player</a>';
+    showCtrl();
+    return;
+  }
+  if (mode === "count"){
+    value = Math.min(value, MAX_COUNT);
+    if (value <= 0){ status("0 songs requested - nothing to download."); showCtrl(); return; }
+    if (value === MAX_COUNT) log("count capped at " + MAX_COUNT);
+  } else {
+    value = Math.min(value, MAX_SECONDS);
+    if (value <= 0){ status("Duration must be greater than 0 seconds."); showCtrl(); return; }
+    if (value === MAX_SECONDS) log("duration capped at " + fmtDur(MAX_SECONDS));
+  }
+  $("note").textContent = "Songs are picked at random from "
+    + "the whole catalog. Your browser may ask to allow multiple downloads - "
+    + "click Allow. Files go to your Downloads folder.";
+  status("loading catalog...");
+  try {
+    M = await (await fetch(BASE + "data/manifest.json")).json();
+  } catch (e){ status("could not load catalog: " + e.message); showCtrl(); return; }
+  log("catalog: " + M.total.toLocaleString() + " tracks in "
+    + M.chunks.length + " chunks");
+  const t0 = Date.now();
+  try {
+    if (mode === "count") await runCount(value);
+    else await runDuration(value);
+  } catch (e){ log("FATAL: " + (e.message || e)); }
+  status("DONE - " + songs + " random song(s), " + fmtDur(totalSec) + " total, "
+    + mp3s + " mp3 + " + tss + " ts, in " + ((Date.now() - t0) / 1000).toFixed(0) + "s");
+  log("done: " + songs + " songs, " + fmtDur(totalSec) + " of audio");
+  showCtrl();
+})();
+</script></body></html>
