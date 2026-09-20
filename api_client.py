@@ -1,37 +1,94 @@
+#!/usr/bin/env python3
 """
-api_client.py - BeatStars random-song API client (pure Python, no browser).
+api_client.py v2 - BeatStars random-song API client with custom folders.
 
+Link formats (folder part is optional):
+  https://<site>/api/<count>                    e.g. .../api/5
+  https://<site>/api/<count>/folder/<name>      e.g. .../api/5/folder/TrapMix
+  https://<site>/api/duration/<seconds>         e.g. .../api/duration/1200
+  https://<site>/api/duration/<seconds>/folder/<name>
+  (?folder=<name> is also accepted on either link)
+
+Output folder rules:
+  --out PATH + URL folder   ->  PATH/<folder>
+  --out PATH                ->  PATH
+  URL folder only           ->  ./<folder>
+  neither                   ->  ./api_downloads
+
+Examples:
   python api_client.py https://dexterolsen2.github.io/beatstarstrapnovocals/api/5
-  python api_client.py https://dexterolsen2.github.io/beatstarstrapnovocals/api/duration/1200
+  python api_client.py https://dexterolsen2.github.io/beatstarstrapnovocals/api/5/folder/TrapMix
+  python api_client.py https://dexterolsen2.github.io/beatstarstrapnovocals/api/duration/1200 --out E:/Music
+  python api_client.py https://dexterolsen2.github.io/beatstarstrapnovocals/api/duration/1200/folder/Chill -o D:/Beats
 
-/api/N          -> downloads N random songs
-/api/duration/S -> downloads random songs until total duration >= S seconds
-                   (overshoot limited to one song)
-Saves .mp3 if ffmpeg is installed, otherwise .ts (plays in VLC).
-Output folder: ./api_downloads
+All songs are picked at RANDOM. Saves .mp3 if ffmpeg is installed, else .ts (VLC-playable).
 """
-import os, random, re, shutil, subprocess, sys, time
-from urllib.parse import urljoin
+import argparse
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
 import requests
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-OUT = "api_downloads"
+
+
+def sanitize_folder(s):
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip().strip(".")
+    return s[:80]
+
 
 def parse_link(url):
-    url = url.rstrip("/")
-    m = re.match(r"^(.*?)/api/duration/([\d.]+)$", url)
-    if m: return m.group(1) + "/", "duration", float(m.group(2))
-    m = re.match(r"^(.*?)/api/(\d+)$", url)
-    if m: return m.group(1) + "/", "count", int(m.group(2))
-    sys.exit("link must end in /api/<songs> or /api/duration/<seconds>")
+    if "//" not in url:
+        url = "https://" + url
+    u = urlparse(url)
+    qs = parse_qs(u.query)
+    folder = (qs.get("folder") or [""])[0]          # ?folder=... variant
+    p = u.path.rstrip("/")
+    m = re.match(r"^(.*)/api/duration/([\d.]+)(?:/folder/([^/]+))?$", p)
+    if m:
+        mode, value = "duration", float(m.group(2))
+        if m.group(3):
+            folder = unquote(m.group(3))
+    else:
+        m = re.match(r"^(.*)/api/(\d+)(?:/folder/([^/]+))?$", p)
+        if not m:
+            sys.exit("link must be /api/<songs> or /api/duration/<seconds> "
+                     "(optionally followed by /folder/<name>)")
+        mode, value = "count", int(m.group(2))
+        if m.group(3):
+            folder = unquote(m.group(3))
+    base = "%s://%s%s/" % (u.scheme, u.netloc, m.group(1))
+    return base, mode, value, folder
+
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__); sys.exit(1)
-    base, mode, value = parse_link(sys.argv[1])
-    os.makedirs(OUT, exist_ok=True)
+    ap = argparse.ArgumentParser(
+        description="BeatStars random-song API client (custom folders supported)")
+    ap.add_argument("link",
+                    help="API link, e.g. https://.../api/5/folder/TrapMix")
+    ap.add_argument("--out", "-o", default=None,
+                    help="base output directory (URL folder appended if present)")
+    args = ap.parse_args()
+
+    base, mode, value, url_folder = parse_link(args.link)
+    folder = sanitize_folder(url_folder)
+    if args.out:
+        root = os.path.expanduser(args.out)
+        out = os.path.join(root, folder) if folder else root
+    else:
+        out = folder if folder else "api_downloads"
+    os.makedirs(out, exist_ok=True)
+
     have_ff = shutil.which("ffmpeg") is not None
     print("site:", base, "| mode:", mode, "| value:", value)
+    print("output folder:", os.path.abspath(out))
     print("ffmpeg:", "yes (mp3)" if have_ff else "NOT FOUND (raw .ts)")
 
     man = requests.get(urljoin(base, "data/manifest.json"), headers=UA,
@@ -110,11 +167,11 @@ def main():
                 blob += requests.get(s, headers=UA, timeout=60).content
         except Exception as e:
             print("FAILED ({})".format(e)); continue
-        ts_path = os.path.join(OUT, name + ".ts")
+        ts_path = os.path.join(out, name + ".ts")
         with open(ts_path, "wb") as f:
             f.write(blob)
         if have_ff:
-            mp3_path = os.path.join(OUT, name + ".mp3")
+            mp3_path = os.path.join(out, name + ".mp3")
             p = subprocess.run(["ffmpeg", "-y", "-i", ts_path, "-vn",
                                 "-c:a", "libmp3lame", "-b:a", "192k", mp3_path],
                                capture_output=True, timeout=600)
@@ -128,7 +185,8 @@ def main():
         print("    -> {} songs, {:.0f}s total".format(n, total))
         time.sleep(0.3)
     print("\nDONE: {} songs, {:.0f}s of audio -> {}".format(
-        n, total, os.path.abspath(OUT)))
+        n, total, os.path.abspath(out)))
+
 
 if __name__ == "__main__":
     main()
