@@ -16,18 +16,20 @@ input{padding:8px;background:#1a1a1e;color:#eee;border:1px solid #333;
 border-radius:6px;width:110px}
 button{padding:8px 14px;background:#1a1a1e;color:#eee;border:1px solid #333;
 border-radius:6px;cursor:pointer}button:hover{background:#26262c}
+#startBtn{font-size:16px;padding:12px 20px;margin-top:14px;border-color:#4a8cff}
 a{color:#4a8cff;text-decoration:none}
-code{background:#1a1a1e;padding:2px 6px;border-radius:4px;font-size:12px}
 </style></head><body><div id="box">
 <h1 id="title">&#127925; Free Trap Beats API</h1>
 <div id="status">starting...</div>
+<button id="startBtn" style="display:none">Choose location &amp; start</button>
 <div id="log"></div>
 <div id="note"></div>
 <div class="ctrl" id="ctrl" style="display:none">
   <input id="cN" type="number" min="1" max="500" placeholder="songs">
-  <button onclick="goCount()">Download N songs</button>
+  <button onclick="goCount()">N songs</button>
   <input id="cD" type="number" min="1" placeholder="seconds">
   <button onclick="goDur()">Fill duration</button>
+  <input id="cF" type="text" placeholder="folder (optional)" style="width:150px">
   <button onclick="location.href=BASE">Open player</button>
 </div>
 </div>
@@ -35,19 +37,26 @@ code{background:#1a1a1e;padding:2px 6px;border-radius:4px;font-size:12px}
 "use strict";
 const PROXY = ""; // if Chrome fails segment fetches (CORS): "https://corsproxy.io/?url="
 const path = location.pathname;
-// site base: "/beatstarstrapnovocals/" (works for any repo name / local test)
 const BASE = path.includes("/api/")
   ? path.slice(0, path.indexOf("/api/") + 1)
   : path.replace(/[^/]*$/, "");
 
+// ---------- URL parsing: count / duration / optional folder ----------
+function safeDecode(s){ try { return decodeURIComponent(s); } catch(_){ return s; } }
+function sanitizeFolder(s){
+  return String(s || "").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, " ").trim().replace(/^\.+|\.+$/g, "").slice(0, 80);
+}
 const q = new URLSearchParams(location.search);
-const mDur = path.match(/\/api\/duration\/(\d+(?:\.\d+)?)\/?$/);
-const mCnt = path.match(/\/api\/(\d+)\/?$/);
+let urlFolder = q.get("folder") || "";        // ?folder= (already decoded)
+const mDur = path.match(/\/api\/duration\/(\d+(?:\.\d+)?)\/?(?:folder\/([^\/]+))?\/?$/);
+const mCnt = path.match(/\/api\/(\d+)\/?(?:folder\/([^\/]+))?\/?$/);
 let mode = null, value = 0;
-if (mDur){ mode = "duration"; value = parseFloat(mDur[1]); }
-else if (mCnt){ mode = "count"; value = parseInt(mCnt[1], 10); }
+if (mDur){ mode = "duration"; value = parseFloat(mDur[1]); if (mDur[2]) urlFolder = safeDecode(mDur[2]); }
+else if (mCnt){ mode = "count"; value = parseInt(mCnt[1], 10); if (mCnt[2]) urlFolder = safeDecode(mCnt[2]); }
 else if (q.get("duration")){ mode = "duration"; value = parseFloat(q.get("duration")); }
 else if (q.get("count")){ mode = "count"; value = parseInt(q.get("count"), 10); }
+const folder = sanitizeFolder(urlFolder);
 
 const MAX_COUNT = 500, MAX_SECONDS = 2592000;  // 500 songs / 30 days per request
 let M = null, chunkCache = {}, used = new Set();
@@ -67,16 +76,48 @@ function fmtDur(s){
   return (h ? h + "h " : "") + (m ? m + "m " : "") + (s % 60) + "s";
 }
 function showCtrl(){ $("ctrl").style.display = "flex"; }
+function folderPart(){
+  const f = sanitizeFolder($("cF").value);
+  return f ? "/folder/" + encodeURIComponent(f) : "";
+}
 function goCount(){
   const n = parseInt($("cN").value, 10);
-  if (n > 0) location.href = BASE + "api/" + Math.min(n, MAX_COUNT);
+  if (n > 0) location.href = BASE + "api/" + Math.min(n, MAX_COUNT) + folderPart();
 }
 function goDur(){
   const s = parseInt($("cD").value, 10);
-  if (s > 0) location.href = BASE + "api/duration/" + Math.min(s, MAX_SECONDS);
+  if (s > 0) location.href = BASE + "api/duration/" + Math.min(s, MAX_SECONDS) + folderPart();
 }
 
-// ---------------- random track picker (whole catalog, no repeats) ----------------
+// ---------- custom folder writing (File System Access API) ----------
+const fsSupported = typeof window.showDirectoryPicker === "function";
+let dirHandle = null, fsBroken = false, fsFallbackPrefix = "";
+
+async function saveFile(bytes, name, mime){
+  if (dirHandle && !fsBroken){
+    try {
+      const fh = await dirHandle.getFileHandle(name, {create: true});
+      const w = await fh.createWritable();
+      await w.write(bytes);
+      await w.close();
+      return true;
+    } catch (e) {
+      fsBroken = true;
+      log("folder write failed (" + (e.message || e) + ") - switching to Downloads");
+    }
+  }
+  saveBlob(new Blob([bytes], {type: mime}), fsFallbackPrefix + name);
+  return false;
+}
+function saveBlob(blob, name){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+}
+
+// ---------- random track picker ----------
 async function pickRandom(){
   for (let a = 0; a < 30; a++){
     const ci = Math.floor(Math.random() * M.chunks.length);
@@ -93,7 +134,7 @@ async function pickRandom(){
   return null;
 }
 
-// ---------------- playlist resolution + duration ----------------
+// ---------- playlist resolution + duration ----------
 async function fetchText(u){
   const r = await fetch(PROXY ? PROXY + encodeURIComponent(u) : u);
   if (!r.ok) throw new Error("HTTP " + r.status);
@@ -124,7 +165,7 @@ async function resolvePlaylist(t){
   } catch (e){ return null; }
 }
 
-// ---------------- MP3 encoder (probed sources, fresh instance per song) ----------------
+// ---------- MP3 encoder (probed sources, fresh instance per song) ----------
 const FF_LIB_CANDIDATES = [
   { label: "self-hosted", url: new URL("ff/ffmpeg.min.js", location.origin + BASE).href },
   { label: "jsdelivr CDN", url: "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" },
@@ -217,15 +258,8 @@ function concatU8(arrs){
   for (const a of arrs){ if (a && a.length){ out.set(a, off); off += a.length; } }
   return out;
 }
-function saveBlob(blob, name){
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 30000);
-}
 
-// ---------------- download one song ----------------
+// ---------- download one song ----------
 async function fetchBuf(u){
   const r = await fetch(PROXY ? PROXY + encodeURIComponent(u) : u);
   if (!r.ok) throw new Error("HTTP " + r.status);
@@ -268,13 +302,14 @@ async function downloadOne(t, res, idx, totalN, target){
       try { mp3 = await encodeToMP3(raw, inName, metaTitle, attempt); }
       catch (e){ console.error("encode attempt " + attempt, e); coreRotate++; }
     }
+    const where = dirHandle && !fsBroken ? " -> " + dirHandle.name : "";
     if (mp3){
-      saveBlob(new Blob([mp3], {type: "audio/mpeg"}), fname + ".mp3");
-      log("   saved " + fname + ".mp3 (" + (mp3.length / 1048576).toFixed(1) + " MB)");
+      await saveFile(mp3, fname + ".mp3", "audio/mpeg");
+      log("   saved " + fname + ".mp3 (" + (mp3.length / 1048576).toFixed(1) + " MB)" + where);
       return "mp3";
     }
-    saveBlob(new Blob([raw], {type: "video/mp2t"}), fname + ".ts");
-    log("   saved " + fname + ".ts (raw - encoder unavailable)");
+    await saveFile(raw, fname + ".ts", "video/mp2t");
+    log("   saved " + fname + ".ts (raw - encoder unavailable)" + where);
     return "ts";
   } catch (e) {
     log("   FAILED: " + (e.message || e));
@@ -282,7 +317,7 @@ async function downloadOne(t, res, idx, totalN, target){
   }
 }
 
-// ---------------- the two API modes ----------------
+// ---------- the two API modes ----------
 async function runCount(n){
   let attempts = 0;
   const maxAtt = n * 5 + 20;
@@ -308,23 +343,63 @@ async function runDuration(target){
     used.add(t.i);
     const res = await resolvePlaylist(t);
     if (!res){ log("skip (dead/encrypted stream): " + (t.t || t.i)); continue; }
-    // if this song pushes the total to/past the target, it is the LAST one
+    // the song that pushes the total to/past the target is the LAST one
     const kind = await downloadOne(t, res, songs + 1, null, target);
     if (kind){ songs++; totalSec += res.duration;
       if (kind === "mp3") mp3s++; else tss++; }
-    else log("hard failure - picking a replacement");
     status("progress: " + songs + " songs, " + fmtDur(totalSec)
       + " / " + fmtDur(target));
   }
 }
 
-// ---------------- boot ----------------
+// ---------- start / boot ----------
+async function start(){
+  $("note").textContent = "Songs are picked at random from the whole catalog. "
+    + (dirHandle
+       ? "Files are written directly into the folder you chose - no download prompts."
+       : (folder
+          ? 'Files are named "' + folder + ' - <song>" and go to your Downloads folder.'
+          : "Your browser may ask to allow multiple downloads - click Allow."));
+  status("loading catalog...");
+  try {
+    M = await (await fetch(BASE + "data/manifest.json")).json();
+  } catch (e){ status("could not load catalog: " + e.message); showCtrl(); return; }
+  log("catalog: " + M.total.toLocaleString() + " tracks in " + M.chunks.length + " chunks");
+  const t0 = Date.now();
+  try {
+    if (mode === "count") await runCount(value);
+    else await runDuration(value);
+  } catch (e){ log("FATAL: " + (e.message || e)); }
+  status("DONE - " + songs + " random song(s), " + fmtDur(totalSec) + " total, "
+    + mp3s + " mp3 + " + tss + " ts, in " + ((Date.now() - t0) / 1000).toFixed(0) + "s");
+  log("done: " + songs + " songs, " + fmtDur(totalSec) + " of audio");
+  showCtrl();
+}
+
+ $("startBtn").onclick = async () => {
+  $("startBtn").disabled = true;
+  try {
+    const base = await window.showDirectoryPicker({mode: "readwrite"});
+    dirHandle = folder
+      ? await base.getDirectoryHandle(folder, {create: true})
+      : base;
+    log("output folder: " + dirHandle.name);
+  } catch (e){
+    status("folder selection cancelled - click the button to try again");
+    $("startBtn").disabled = false;
+    return;
+  }
+  $("startBtn").style.display = "none";
+  start();
+};
+
 (async () => {
   if (!mode){
     $("title").textContent = "404 - Page not found";
     status("This page does not exist - but the API does:");
-    log("count mode:    " + BASE + "api/<songs>          e.g. " + BASE + "api/5");
+    log("count mode:    " + BASE + "api/<songs>              e.g. " + BASE + "api/5");
     log("duration mode: " + BASE + "api/duration/<seconds>   e.g. " + BASE + "api/duration/1200");
+    log("custom folder: " + BASE + "api/5/folder/MyFolder  or  " + BASE + "api/duration/1200/folder/MyFolder");
     log("all songs are picked at RANDOM from the whole catalog");
     $("note").innerHTML = 'Open an API link and the songs download automatically. '
       + '<a href="' + BASE + '">Back to the player</a>';
@@ -340,23 +415,18 @@ async function runDuration(target){
     if (value <= 0){ status("Duration must be greater than 0 seconds."); showCtrl(); return; }
     if (value === MAX_SECONDS) log("duration capped at " + fmtDur(MAX_SECONDS));
   }
-  $("note").textContent = "Songs are picked at random from "
-    + "the whole catalog. Your browser may ask to allow multiple downloads - "
-    + "click Allow. Files go to your Downloads folder.";
-  status("loading catalog...");
-  try {
-    M = await (await fetch(BASE + "data/manifest.json")).json();
-  } catch (e){ status("could not load catalog: " + e.message); showCtrl(); return; }
-  log("catalog: " + M.total.toLocaleString() + " tracks in "
-    + M.chunks.length + " chunks");
-  const t0 = Date.now();
-  try {
-    if (mode === "count") await runCount(value);
-    else await runDuration(value);
-  } catch (e){ log("FATAL: " + (e.message || e)); }
-  status("DONE - " + songs + " random song(s), " + fmtDur(totalSec) + " total, "
-    + mp3s + " mp3 + " + tss + " ts, in " + ((Date.now() - t0) / 1000).toFixed(0) + "s");
-  log("done: " + songs + " songs, " + fmtDur(totalSec) + " of audio");
-  showCtrl();
+  if (folder && fsSupported){
+    // a click is required before the browser lets us pick a directory
+    status('Folder "' + folder + '" requested - choose where to create it:');
+    $("startBtn").textContent = 'Create "' + folder + '" & start downloading';
+    $("startBtn").style.display = "inline-block";
+    return;
+  }
+  if (folder){
+    fsFallbackPrefix = folder + " - ";
+    log('Note: this browser cannot write into folders directly. '
+      + 'Files will be named "' + folder + ' - <song>" and go to Downloads.');
+  }
+  start();
 })();
 </script></body></html>
